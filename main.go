@@ -11,7 +11,7 @@ import (
 const usageText = `psw - switch between model API providers
 
 Usage:
-  psw add <name> [--url URL]   create a provider (prompts for API key, stored in Keychain)
+  psw add <name> [--url URL]   create a provider (prompts for API key, stored in the secret store)
   psw rm <name>                remove a provider and its key
   psw edit <name>              edit a provider's env vars in $EDITOR
   psw set-key <name>           replace the API key in Keychain
@@ -104,6 +104,7 @@ func cmdAdd(args []string, stdout, stderr io.Writer) error {
 	if err := keychainStore(name, key); err != nil {
 		return err
 	}
+	warnFileBackend(name, stderr)
 	var kvs []kv
 	if url != "" {
 		kvs = []kv{{"ANTHROPIC_BASE_URL", url}}
@@ -174,8 +175,18 @@ func cmdSetKey(args []string, stdout, stderr io.Writer) error {
 	if err := keychainStore(name, key); err != nil {
 		return err
 	}
+	warnFileBackend(name, stderr)
 	fmt.Fprintf(stdout, "updated key for provider %q\n", name)
 	return nil
+}
+
+// warnFileBackend tells the user the key landed in a 0600 file instead of
+// a system secret store, so they know why there is no Keychain entry.
+func warnFileBackend(name string, stderr io.Writer) {
+	if keychainBackend() == "file" {
+		fmt.Fprintf(stderr, "psw: warning: no secret store (security/secret-tool) found; key stored in %s (0600)\n",
+			keyFilePath(name))
+	}
 }
 
 func cmdList(args []string, stdout, stderr io.Writer) error {

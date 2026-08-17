@@ -7,56 +7,156 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 )
 
 const keychainService = "provider-switcher"
 
-// keychainTimeout bounds `security` calls: with a locked keychain the CLI
-// can sit on a GUI unlock prompt indefinitely.
+// keychainTimeout bounds secret-store CLI calls: with a locked keyring the
+// CLI can sit on a GUI unlock prompt indefinitely.
 const keychainTimeout = 60 * time.Second
 
-// All Keychain access goes through the system `security` CLI so we take no
-// Keychain API dependency. Tests fake it by putting shims on PATH.
+// Keys live in the best secret store available on this machine, chosen at
+// runtime by keychainBackend():
+//
+//   - macOS: the Keychain via the `security` CLI
+//   - Linux: the freedesktop Secret Service (GNOME Keyring, KWallet) via
+//     `secret-tool`, when installed
+//   - otherwise: a 0600 file under the config dir
+//
+// Everything goes through system CLIs or plain files so we take no
+// platform API dependency. Tests steer the choice by shimming PATH.
 
-func securityCmd(args ...string) ([]byte, error) {
+// keychainBackend reports where keys are stored. Detection is by binary
+// presence only; it is cheap, so callers may call it more than once.
+func keychainBackend() string {
+	if _, err := exec.LookPath("security"); err == nil {
+		return "security"
+	}
+	if _, err := exec.LookPath("secret-tool"); err == nil {
+		return "secret-tool"
+	}
+	return "file"
+}
+
+// runSecretCmd runs a secret-store CLI with the shared timeout. The error
+// message shows the args with -w values redacted so a failed call never
+// prints the key.
+func runSecretCmd(bin string, stdin io.Reader, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), keychainTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "security", args...)
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Stdin = stdin
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		if ctx.Err() != nil {
-			return out, fmt.Errorf("security %v timed out: %w", args, ctx.Err())
+			return out, fmt.Errorf("%s %v timed out: %w", bin, redactArgs(args), ctx.Err())
 		}
-		return out, fmt.Errorf("security %v: %w: %s", args, err, strings.TrimSpace(string(out)))
+		return out, fmt.Errorf("%s %v: %w: %s", bin, redactArgs(args), err, strings.TrimSpace(string(out)))
 	}
 	return out, nil
 }
 
+// redactArgs masks the value after -w (the Keychain key) in arg slices
+// destined for error messages.
+func redactArgs(args []string) []string {
+	out := make([]string, len(args))
+	copy(out, args)
+	for i, a := range out {
+		if a == "-w" && i+1 < len(out) {
+			out[i+1] = "***"
+		}
+	}
+	return out
+}
+
+func securityCmd(args ...string) ([]byte, error) {
+	return runSecretCmd("security", nil, args...)
+}
+
+// secretToolCmd runs secret-tool; store passes the key on stdin so it
+// never appears in the process list.
+func secretToolCmd(stdin io.Reader, args ...string) ([]byte, error) {
+	return runSecretCmd("secret-tool", stdin, args...)
+}
+
+// keyFilePath is the file-backend location. It lives under the config dir
+// so PSW_CONFIG_DIR keeps tests and containers self-contained.
+func keyFilePath(name string) string {
+	return filepath.Join(configDir(), "keys", name)
+}
+
 func keychainStore(name, key string) error {
-	_, err := securityCmd("add-generic-password",
-		"-s", keychainService, "-a", name, "-w", key, "-U")
-	if err != nil {
-		return fmt.Errorf("storing key for %q in Keychain: %w", name, err)
+	switch keychainBackend() {
+	case "security":
+		if _, err := securityCmd("add-generic-password",
+			"-s", keychainService, "-a", name, "-w", key, "-U"); err != nil {
+			return fmt.Errorf("storing key for %q in Keychain: %w", name, err)
+		}
+	case "secret-tool":
+		if _, err := secretToolCmd(strings.NewReader(key), "store",
+			"--label", "psw: "+name, "service", keychainService, "account", name); err != nil {
+			return fmt.Errorf("storing key for %q in the secret store: %w", name, err)
+		}
+	default:
+		if err := os.MkdirAll(filepath.Dir(keyFilePath(name)), 0o700); err != nil {
+			return err
+		}
+		if err := os.WriteFile(keyFilePath(name), []byte(key), 0o600); err != nil {
+			return fmt.Errorf("writing key file for %q: %w", name, err)
+		}
 	}
 	return nil
 }
 
+// noKeyErr is the shared "key not found" error across backends.
+func noKeyErr(name string, cause error) error {
+	return fmt.Errorf("no key for %q: run `psw set-key %s`: %w", name, name, cause)
+}
+
 func keychainGet(name string) (string, error) {
-	out, err := securityCmd("find-generic-password",
-		"-s", keychainService, "-a", name, "-w")
-	if err != nil {
-		return "", fmt.Errorf("no key for %q in Keychain: run `psw set-key %s`: %w",
-			name, name, err)
+	switch keychainBackend() {
+	case "security":
+		out, err := securityCmd("find-generic-password",
+			"-s", keychainService, "-a", name, "-w")
+		if err != nil {
+			return "", noKeyErr(name, err)
+		}
+		return strings.TrimSpace(string(out)), nil
+	case "secret-tool":
+		out, err := secretToolCmd(nil, "lookup",
+			"service", keychainService, "account", name)
+		if err != nil {
+			return "", noKeyErr(name, err)
+		}
+		return strings.TrimSpace(string(out)), nil
+	default:
+		data, err := os.ReadFile(keyFilePath(name))
+		if err != nil {
+			return "", noKeyErr(name, err)
+		}
+		return strings.TrimSpace(string(data)), nil
 	}
-	return strings.TrimSpace(string(out)), nil
 }
 
 func keychainDelete(name string) error {
-	if _, err := securityCmd("delete-generic-password",
-		"-s", keychainService, "-a", name); err != nil {
-		return fmt.Errorf("deleting key for %q from Keychain: %w", name, err)
+	switch keychainBackend() {
+	case "security":
+		if _, err := securityCmd("delete-generic-password",
+			"-s", keychainService, "-a", name); err != nil {
+			return fmt.Errorf("deleting key for %q from Keychain: %w", name, err)
+		}
+	case "secret-tool":
+		if _, err := secretToolCmd(nil, "clear",
+			"service", keychainService, "account", name); err != nil {
+			return fmt.Errorf("deleting key for %q from the secret store: %w", name, err)
+		}
+	default:
+		if err := os.Remove(keyFilePath(name)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("deleting key file for %q: %w", name, err)
+		}
 	}
 	return nil
 }

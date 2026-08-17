@@ -4,13 +4,17 @@ Same model, multiple providers — switch API key and env vars in one command.
 
 [![CI](https://github.com/yhkl-dev/provider-swtich/actions/workflows/ci.yml/badge.svg)](https://github.com/yhkl-dev/provider-swtich/actions/workflows/ci.yml)
 
-API keys live in the macOS Keychain; per-provider env vars in plain files under
-`~/.config/provider-switcher/`. `psw use <name>` switches the active provider
-and prints `export` statements for the current shell.
+API keys live in the platform's secret store — the macOS Keychain (`security`),
+the Linux Secret Service (`secret-tool`, e.g. GNOME Keyring) — or, when neither
+is available, a 0600 file under the config dir. Per-provider env vars are plain
+files under `~/.config/provider-switcher/`. `psw use <name>` switches the active
+provider and prints `export` statements for the current shell.
 
 ## Install
 
-Requires Go and macOS (Keychain via the `security` CLI).
+Requires Go. On macOS keys go to the Keychain; on Linux `secret-tool` is
+optional (Debian: `apt install libsecret-tools`) — without it, keys are stored
+in a 0600 file under the config dir and `install.sh` says so.
 
 ```sh
 ./install.sh
@@ -43,7 +47,7 @@ psw() {
 
 ```sh
 psw add zhipu-maas --url https://token-plan.cn-beijing.maas.aliyuncs.com/apps/anthropic
-# prompts for the API key, stored in macOS Keychain (service: provider-switcher)
+# prompts for the API key, stored in the platform secret store (service: provider-switcher)
 
 psw edit zhipu-maas          # opens $EDITOR on the provider's env vars
 # add lines like:
@@ -66,7 +70,9 @@ Provider files are `KEY=VALUE` lines (no `export` prefix); lines starting with
 - `~/.config/provider-switcher/providers/<name>` — one file per provider,
   `KEY=VALUE` lines, `#` comments. The API key is never written here.
 - `~/.config/provider-switcher/active` — symlink to the active provider.
-- Keychain — service `provider-switcher`, account = provider name.
+- Secret store — service `provider-switcher`, account = provider name: macOS
+  Keychain (`security`), Linux Secret Service (`secret-tool`), or a 0600 file at
+  `~/.config/provider-switcher/keys/<name>` when neither CLI exists.
 - `PSW_CONFIG_DIR` overrides the state directory (tests, containers).
 
 ## Development

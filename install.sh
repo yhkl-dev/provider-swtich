@@ -12,6 +12,16 @@ install -m 755 psw "$BIN/psw"
 rm -f psw
 echo "installed psw to $BIN/psw"
 
+# On Linux, note the storage backend psw will use: secret-tool when
+# present, a 0600 file otherwise. macOS always has Keychain (`security`).
+case "$(uname -s)" in
+    Linux)
+        if ! command -v secret-tool >/dev/null 2>&1; then
+            echo "note: secret-tool not found; psw will store keys in a 0600 file"
+        fi
+        ;;
+esac
+
 RC="${RC:-$HOME/.zshrc}"
 if [ -f "$RC" ] && grep -q '# psw:' "$RC"; then
     echo "shell wrapper already in $RC"
